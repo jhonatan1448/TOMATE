@@ -1,42 +1,35 @@
-import json
+import copy
 import hashlib
+import json
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-from scipy.optimize import lsq_linear
 
+try:
+    from scipy.optimize import lsq_linear
+except ImportError:
+    lsq_linear = None
+
+
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
 
 st.set_page_config(
-    page_title="TOMATE · Formulador",
+    page_title="TOMATE · Formulador de fertirriego",
     page_icon="🍅",
     layout="wide",
 )
 
 ELEMENTOS = [
     "N", "P", "K", "Ca", "Mg", "S",
-    "Fe", "Mn", "Zn", "B", "Cu", "Mo", "Co",
-]
-MACROS = ["N", "P", "K", "Ca", "Mg", "S"]
-ETAPAS = ["Vegetativo", "Desarrollo", "Llenado"]
-
-FILAS = [
-    ("N", 293.3, 30, 40, 30, "N", 1.0),
-    ("P2O5", 152.0, 38, 32, 30, "P", 0.4364),
-    ("K2O", 626.7, 23, 32, 45, "K", 0.8301),
-    ("CaO", 296.0, 30, 40, 30, "Ca", 0.7147),
-    ("MgO", 89.3, 30, 40, 30, "Mg", 0.6030),
-    ("S", 84.0, 38, 32, 30, "S", 1.0),
-    ("Fe", 4.3, 25, 30, 45, "Fe", 1.0),
-    ("Mn", 2.0, 25, 30, 45, "Mn", 1.0),
-    ("Zn", 1.07, 25, 30, 45, "Zn", 1.0),
-    ("B", 0.80, 25, 30, 45, "B", 1.0),
-    ("Cu", 0.67, 25, 30, 45, "Cu", 1.0),
-    ("Mo", 0.01, 25, 30, 45, "Mo", 1.0),
-    ("Co", 0.13, 25, 30, 45, "Co", 1.0),
+    "B", "Cu", "Fe", "Mn", "Zn", "Mo",
 ]
 
-FACTORES_PLAN = {r[0]: (r[5], r[6]) for r in FILAS}
+FORMAS_N = ["N_nitrico", "N_amoniacal", "N_ureico"]
+
+# Fracción elemental dentro del óxido.
 OXIDOS = {
     "P": ("P2O5", 0.4364),
     "K": ("K2O", 0.8301),
@@ -45,804 +38,1004 @@ OXIDOS = {
     "S": ("SO3", 0.4005),
 }
 
-COLUMNAS = [
-    "ID", "Producto", "Estado",
-    "Bloqueo original", "Apto para cálculo",
-    "Motivos", "Desconocidos",
-] + ELEMENTOS
+PERFILES_CONFIRMADOS = {
+    "Van Iperen Producción": {
+        "nutrientes": {
+            "N_total": 12.0,
+            "N_nitrico": 11.0,
+            "N_amoniacal": 1.0,
+            "P2O5": 5.0,
+            "K2O": 40.0,
+            "B": 0.02,
+            "Cu": 0.011,
+            "Fe": 0.1,
+            "Mn": 0.05,
+            "Zn": 0.02,
+            "Mo": 0.01,
+        },
+    },
+    "Van Iperen MagBoro": {
+        "nutrientes": {
+            "N_total": 11.0,
+            "N_nitrico": 11.0,
+            "MgO": 15.7,
+            "B": 0.13,
+        },
+        "bloquear": True,
+        "pendientes": [
+            "Lote informado vencido en abril de 2025. "
+            "No habilitar este lote para aplicación."
+        ],
+    },
+    "Haifa Poly-Feed Producción": {
+        "nutrientes": {
+            "N_total": 10.0,
+            "N_nitrico": 10.0,
+            "P2O5": 10.0,
+            "K2O": 43.0,
+            "B": 0.02,
+            "Cu": 0.01,
+            "Fe": 0.1,
+            "Mn": 0.05,
+            "Zn": 0.02,
+        },
+    },
+    "Haifa DKP": {
+        "nutrientes": {
+            "N_total": 0.0,
+            "P2O5": 41.0,
+            "K2O": 54.0,
+        },
+        "advertencias": [
+            "Revisar alcalinidad y compatibilidad. "
+            "La composición no permite calcular el pH final."
+        ],
+    },
+    "Naturzinc-WSP": {
+        "nutrientes": {"Zn": 13.0},
+        "advertencias": ["Zn declarado 100 % quelatado con EDTA."],
+    },
+    "Naturmanganeso-WSP": {
+        "nutrientes": {"Mn": 12.0},
+        "advertencias": ["Mn declarado 100 % quelatado con EDTA."],
+    },
+    "Naturquel-Fe 4,8": {
+        "nutrientes": {"Fe": 6.0},
+        "bloquear": True,
+        "pendientes": [
+            "Aclarar con el proveedor la discrepancia EDDHA/EDTA."
+        ],
+        "advertencias": [
+            "El 4,8 % orto-orto está incluido en el 6 % de Fe total."
+        ],
+    },
+    "Kellus Cu": {
+        "nutrientes": {"Cu": 14.5},
+        "bloquear": True,
+        "pendientes": [
+            "Identificar el agente quelatante, si corresponde."
+        ],
+        "advertencias": [
+            "Los metales pesados no se contabilizan como nutrientes. "
+            "Esto no constituye una validación de inocuidad."
+        ],
+    },
+    "Molib-K": {
+        "nutrientes": {"K": 2.49, "B": 8.0, "Mo": 10.0},
+        "bloquear": True,
+        "pendientes": [
+            "Confirmar con el fabricante solubilidad y aptitud "
+            "para fertirriego."
+        ],
+        "advertencias": [
+            "K expresado como elemento, no como K2O.",
+            "Por cada unidad de Mo aporta 0,8 de B y 0,249 de K.",
+        ],
+    },
+}
 
 
-def porcentaje(valor, etiqueta):
-    """None sigue siendo desconocido. Nunca se reemplaza por cero."""
-    if valor is None:
-        return np.nan
-    if isinstance(valor, bool) or not isinstance(valor, (int, float)):
-        raise ValueError(f"{etiqueta}: se esperaba número o null.")
-    valor = float(valor)
-    if not np.isfinite(valor) or not 0 <= valor <= 100:
-        raise ValueError(f"{etiqueta}: porcentaje fuera de 0–100.")
-    return valor
+# ============================================================
+# FUNCIONES GENERALES
+# ============================================================
+
+def numero(valor):
+    """Devuelve float finito; null y valores desconocidos no son cero."""
+    if valor is None or isinstance(valor, bool):
+        return None
+
+    if isinstance(valor, str):
+        valor = valor.strip().replace("%", "").replace(",", ".")
+        if valor.lower() in {"", "null", "none", "nd", "n/d", "-"}:
+            return None
+
+    try:
+        resultado = float(valor)
+        return resultado if np.isfinite(resultado) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def booleano(valor):
+    if isinstance(valor, bool):
+        return valor
+    if isinstance(valor, str):
+        texto = valor.strip().lower()
+        if texto in {"true", "sí", "si", "yes", "1"}:
+            return True
+        if texto in {"false", "no", "0"}:
+            return False
+    if isinstance(valor, (int, float)) and valor in (0, 1):
+        return bool(valor)
+    return None
 
 
 def lista_textos(valor):
     if valor is None:
         return []
+    if isinstance(valor, str):
+        return [valor] if valor.strip() else []
     if isinstance(valor, list):
-        return [str(x) for x in valor]
+        return [str(v) for v in valor if v is not None]
+    if isinstance(valor, dict):
+        return [f"{k}: {v}" for k, v in valor.items()]
     return [str(valor)]
 
 
-def interpretar_producto(identificador, producto):
-    if not isinstance(producto, dict):
-        raise ValueError(f"{identificador}: producto inválido.")
+def unicos(valores):
+    return list(dict.fromkeys(valores))
 
-    nombre = producto.get("nombre")
-    if not isinstance(nombre, str) or not nombre.strip():
-        raise ValueError(f"{identificador}: falta nombre.")
 
-    nombre = nombre.strip()
-    nutrientes = producto.get("nutrientes_pct", {})
-    equivalencias = producto.get("equivalencias_elementales_pct", {})
+def normalizar_catalogo(datos):
+    """
+    Admite productos como diccionario o lista.
+    Conserva los metadatos y los campos originales.
+    """
+    if not isinstance(datos, dict):
+        raise ValueError("La raíz del JSON debe ser un objeto.")
 
-    if not isinstance(nutrientes, dict):
-        raise ValueError(f"{nombre}: nutrientes_pct debe ser un objeto.")
-    if not isinstance(equivalencias, dict):
+    resultado = copy.deepcopy(datos)
+    productos = resultado.get("productos")
+
+    if isinstance(productos, list):
+        convertidos = {}
+        for indice, producto in enumerate(productos, start=1):
+            if not isinstance(producto, dict):
+                raise ValueError(f"El producto {indice} no es un objeto.")
+            identificador = str(producto.get("id", f"producto_{indice}"))
+            if identificador in convertidos:
+                raise ValueError(f"ID duplicado: {identificador}")
+            convertidos[identificador] = producto
+        productos = convertidos
+
+    if not isinstance(productos, dict) or not productos:
         raise ValueError(
-            f"{nombre}: equivalencias_elementales_pct debe ser un objeto."
+            "Se requiere una clave 'productos' con un diccionario "
+            "o una lista no vacía."
         )
 
+    normalizados = {}
+    for identificador, producto in productos.items():
+        if not isinstance(producto, dict):
+            raise ValueError(f"Producto inválido: {identificador}")
+
+        producto = copy.deepcopy(producto)
+        producto.setdefault(
+            "nombre",
+            producto.get("nombre_comercial", str(identificador)),
+        )
+        normalizados[str(identificador)] = producto
+
+    resultado["productos"] = normalizados
+    return resultado
+
+
+def aplicar_perfil_confirmado(producto, nombre_perfil):
+    nuevo = copy.deepcopy(producto)
+    perfil = PERFILES_CONFIRMADOS[nombre_perfil]
+    declarados = perfil["nutrientes"]
+
+    nutrientes = {
+        ("N_total" if elemento == "N" else elemento): 0.0
+        for elemento in ELEMENTOS
+    }
+    nutrientes.update({forma: 0.0 for forma in FORMAS_N})
+
+    for elemento, (oxido, _) in OXIDOS.items():
+        if oxido in declarados:
+            nutrientes.pop(elemento, None)
+
+    nutrientes.update(declarados)
+
+    nuevo.setdefault(
+        "composicion_antes_actualizacion",
+        copy.deepcopy(nuevo.get("nutrientes_pct", {})),
+    )
+    nuevo["nutrientes_pct"] = nutrientes
+    nuevo["equivalencias_elementales_pct"] = {}
+    nuevo["composicion_confirmada_usuario"] = True
+    nuevo["perfil_confirmado"] = nombre_perfil
+    nuevo["criterio_no_declarados"] = (
+        "0 % para balance por acuerdo del usuario; "
+        "no demuestra ausencia analítica."
+    )
+
+    nuevo["pendientes"] = unicos(
+        lista_textos(nuevo.get("pendientes"))
+        + perfil.get("pendientes", [])
+    )
+    nuevo["observaciones"] = unicos(
+        lista_textos(nuevo.get("observaciones"))
+        + perfil.get("advertencias", [])
+        + [nuevo["criterio_no_declarados"]]
+    )
+
+    if perfil.get("bloquear"):
+        nuevo["bloqueado_dosificacion_automatica"] = True
+
+    # No modificar verificado, soluble ni estado.
+    return nuevo
+
+
+def interpretar_producto(identificador, producto):
+    nutrientes = producto.get("nutrientes_pct", {})
+    equivalencias = producto.get("equivalencias_elementales_pct", {})
     motivos = []
     valores = {}
 
+    if not isinstance(nutrientes, dict):
+        nutrientes = {}
+        motivos.append("Formato de nutrientes_pct inválido")
+
+    if not isinstance(equivalencias, dict):
+        equivalencias = {}
+
+    # Un porcentaje inválido bloquea, incluso si no entra en el balance.
+    for clave, valor in nutrientes.items():
+        n = numero(valor)
+        if valor is not None and (
+            n is None or n < 0 or n > 100
+        ):
+            motivos.append(f"Porcentaje inválido: {clave}")
+
     for elemento in ELEMENTOS:
-        clave = "N_total" if elemento == "N" else elemento
-        candidatos = []
-
-        directo = porcentaje(
-            nutrientes.get(clave), f"{nombre} / {clave}"
-        )
-        if np.isfinite(directo):
-            candidatos.append(("declaración elemental", directo))
-
-        if elemento in OXIDOS:
-            oxido, factor = OXIDOS[elemento]
-            valor_oxido = porcentaje(
-                nutrientes.get(oxido), f"{nombre} / {oxido}"
+        if elemento == "N":
+            valor = numero(
+                nutrientes.get("N_total", nutrientes.get("N"))
             )
-            if np.isfinite(valor_oxido):
-                candidatos.append((oxido, valor_oxido * factor))
+        else:
+            directo = numero(nutrientes.get(elemento))
+            convertido = None
 
-        equivalente = porcentaje(
-            equivalencias.get(elemento),
-            f"{nombre} / equivalencia {elemento}",
-        )
-        if np.isfinite(equivalente):
-            candidatos.append(("equivalencia", equivalente))
+            if elemento in OXIDOS:
+                oxido, factor = OXIDOS[elemento]
+                porcentaje_oxido = numero(nutrientes.get(oxido))
+                if porcentaje_oxido is not None:
+                    convertido = porcentaje_oxido * factor
 
-        if candidatos:
-            # Se usa una sola representación: nunca se suman equivalentes.
-            valores[elemento] = candidatos[0][1]
-            for _, otro in candidatos[1:]:
+            if directo is not None and convertido is not None:
                 if not np.isclose(
-                    valores[elemento], otro,
-                    rtol=0.002, atol=0.0001,
+                    directo, convertido, rtol=0.02, atol=0.01
                 ):
                     motivos.append(
-                        f"Declaraciones contradictorias para {elemento}"
+                        f"Inconsistencia entre {elemento} y su óxido"
                     )
-        else:
-            valores[elemento] = np.nan
 
-    # Las formas de N no se suman al N total.
-    formas = [
-        porcentaje(nutrientes.get(k), f"{nombre} / {k}")
-        for k in ["N_nitrico", "N_amoniacal", "N_ureico"]
-    ]
-    conocidas = [x for x in formas if np.isfinite(x)]
-    if np.isfinite(valores["N"]) and conocidas:
-        if sum(conocidas) > valores["N"] + 0.02:
-            motivos.append("Las formas de N superan el N total")
-        if len(conocidas) == 3 and not np.isclose(
-            sum(conocidas), valores["N"], atol=0.02, rtol=0
+            # Nunca sumar elemento y óxido.
+            valor = directo if directo is not None else convertido
+
+        if valor is None:
+            valor = numero(equivalencias.get(elemento))
+
+        if valor is not None and not 0 <= valor <= 100:
+            motivos.append(f"Valor elemental inválido: {elemento}")
+            valor = None
+
+        valores[elemento] = np.nan if valor is None else valor
+
+    formas = {
+        forma: numero(nutrientes.get(forma))
+        for forma in FORMAS_N
+    }
+    conocidas = [v for v in formas.values() if v is not None]
+    total_n = valores["N"]
+
+    if np.isfinite(total_n):
+        if sum(conocidas) > total_n + 0.05:
+            motivos.append("Las formas de N exceden el N total")
+        elif len(conocidas) == 3 and not np.isclose(
+            sum(conocidas), total_n, atol=0.05, rtol=0
         ):
-            motivos.append("El desglose completo de N no coincide con N total")
-
-    if sum(v for v in valores.values() if np.isfinite(v)) > 100.01:
-        raise ValueError(f"{nombre}: suma elemental superior a 100%.")
-
-    bloqueo = producto.get("bloqueado_dosificacion_automatica", True)
-    if not isinstance(bloqueo, bool):
-        raise ValueError(f"{nombre}: el bloqueo debe ser true o false.")
-
-    estado = str(producto.get("estado", "sin_validar"))
-    if bloqueo:
-        motivos.append("Bloqueo original del catálogo")
-
-    # No se infiere verificación ni solubilidad por el nombre comercial.
-    # Estos campos son requisitos de una futura versión validada del catálogo.
-    if producto.get("verificado") is not True:
-        motivos.append("Sin verificación documental explícita")
-    if producto.get("soluble") is not True:
-        motivos.append("Solubilidad para fertirriego sin confirmar")
-
-    pendientes = lista_textos(producto.get("pendientes"))
-    if pendientes:
-        motivos.append("Pendientes técnicos sin resolver")
-
-    criterios = producto.get("criterios_porcentaje") or {}
-    if not isinstance(criterios, dict):
-        raise ValueError(f"{nombre}: criterios_porcentaje inválido.")
-    if any(v not in (None, "", "=") for v in criterios.values()):
-        motivos.append("Contiene umbrales, no porcentajes exactos")
-
-    if "pendiente" in estado.casefold():
-        motivos.append("Estado documental pendiente")
+            motivos.append("Las formas de N no coinciden con N total")
 
     desconocidos = [
-        e for e, valor in valores.items() if not np.isfinite(valor)
+        elemento for elemento, valor in valores.items()
+        if not np.isfinite(valor)
     ]
     if desconocidos:
-        motivos.append("Composición elemental incompleta para el balance")
+        motivos.append(
+            "Composición incompleta: " + ", ".join(desconocidos)
+        )
 
-    if "abonis" in nombre.casefold():
-        motivos.append("Abono de fondo excluido del Venturi")
+    bloqueo = booleano(
+        producto.get("bloqueado_dosificacion_automatica")
+    )
+    if bloqueo is not False:
+        motivos.append(
+            "Bloqueo de dosificación activo"
+            if bloqueo is True
+            else "Autorización de dosificación no declarada"
+        )
 
-    if not any(np.isfinite(v) and v > 0 for v in valores.values()):
-        motivos.append("Sin aportes cuantificados positivos")
+    if booleano(producto.get("verificado")) is not True:
+        motivos.append("Verificación de uso pendiente")
+
+    if booleano(producto.get("soluble")) is not True:
+        motivos.append("Solubilidad para uso pendiente")
+
+    motivos += lista_textos(producto.get("pendientes"))
+
+    nombre = str(producto.get("nombre", identificador))
+    if "abonisa" in nombre.casefold():
+        motivos.append("Abonisa excluido del sistema Venturi")
+
+    estado = str(producto.get("estado", "no declarado"))
+    if any(
+        palabra in estado.casefold()
+        for palabra in ("bloque", "pendiente", "vencid", "no_apto", "no apto")
+    ):
+        motivos.append(f"Estado restrictivo: {estado}")
 
     return {
         "ID": identificador,
         "Producto": nombre,
         "Estado": estado,
+        "Composición confirmada": (
+            producto.get("composicion_confirmada_usuario") is True
+        ),
         "Bloqueo original": bloqueo,
         "Apto para cálculo": not motivos,
-        "Motivos": " | ".join(dict.fromkeys(motivos)),
+        "Motivos": " | ".join(unicos(motivos)),
         "Desconocidos": ", ".join(desconocidos),
         **valores,
+        **{
+            forma: np.nan if valor is None else valor
+            for forma, valor in formas.items()
+        },
     }
 
 
-def leer_catalogo(contenido):
-    if not isinstance(contenido, dict):
-        raise ValueError("La raíz del JSON debe ser un objeto.")
-
-    if contenido.get("version_esquema") != 1:
-        raise ValueError(
-            "Se requiere el catálogo original con version_esquema: 1."
-        )
-
-    productos = contenido.get("productos")
-    if not isinstance(productos, dict) or not productos:
-        raise ValueError("productos debe ser un diccionario no vacío.")
-
-    filas = [
-        interpretar_producto(str(k), producto)
-        for k, producto in productos.items()
-    ]
-    tabla = pd.DataFrame(filas, columns=COLUMNAS)
-
-    if tabla["Producto"].duplicated().any():
-        raise ValueError("Hay nombres de producto repetidos.")
-
-    contexto = contenido.get("contexto_cultivo") or {}
-    if not isinstance(contexto, dict):
-        raise ValueError("contexto_cultivo debe ser un objeto.")
-
-    return tabla, contexto
+def tabla_catalogo(catalogo):
+    return pd.DataFrame([
+        interpretar_producto(identificador, producto)
+        for identificador, producto in catalogo["productos"].items()
+    ])
 
 
-def numero_contexto(contexto, clave, defecto):
-    valor = contexto.get(clave, defecto)
-    if (
-        isinstance(valor, bool)
-        or not isinstance(valor, (int, float))
-        or not np.isfinite(valor)
-        or valor <= 0
-    ):
-        raise ValueError(f"contexto_cultivo / {clave}: valor inválido.")
-    return float(valor)
+# ============================================================
+# IMPORTACIÓN
+# ============================================================
 
+st.title("🍅 TOMATE · Formulador de fertirriego")
 
-def validar_no_negativos(datos, mensaje):
-    matriz = np.asarray(datos, dtype=float)
-    if not np.isfinite(matriz).all() or (matriz < 0).any():
-        st.error(mensaje)
-        st.stop()
-
-
-st.title("🍅 TOMATE · Plan y formulador de fertirriego")
 st.caption(
-    "Simulación para revisión técnica. No controla equipos "
-    "ni certifica dosis, solubilidad o compatibilidad."
+    "Balance nutricional elemental. Los resultados no validan "
+    "compatibilidad química, pH, CE ni seguridad agronómica."
 )
 
-# ---------- IMPORTACIÓN ----------
 with st.sidebar:
-    st.header("Catálogo original")
+    st.header("Catálogo")
+
     archivo = st.file_uploader(
-        "Carga catalogo-fertilizantes.json",
+        "Cargar catálogo de fertilizantes",
         type=["json"],
     )
 
     if archivo is not None:
-        datos_archivo = archivo.getvalue()
-        huella = hashlib.sha256(datos_archivo).hexdigest()
+        contenido = archivo.getvalue()
+        firma = hashlib.sha256(contenido).hexdigest()
 
-        if huella != st.session_state.get("huella_catalogo"):
+        if firma != st.session_state.get("firma_catalogo"):
             try:
-                original = json.loads(datos_archivo.decode("utf-8-sig"))
-                tabla_nueva, contexto_nuevo = leer_catalogo(original)
-
-                area_nueva = numero_contexto(
-                    contexto_nuevo, "superficie_m2", 2500
+                datos = json.loads(contenido.decode("utf-8-sig"))
+                nuevo_catalogo = normalizar_catalogo(datos)
+                st.session_state["catalogo_importado"] = copy.deepcopy(
+                    nuevo_catalogo
                 )
-                plantas_nuevas = numero_contexto(
-                    contexto_nuevo, "plantas", 5000
-                )
-                if not plantas_nuevas.is_integer():
-                    raise ValueError("El número de plantas debe ser entero.")
-
-                st.session_state["catalogo_original"] = original
-                st.session_state["catalogo_tabla"] = tabla_nueva
-                st.session_state["contexto_catalogo"] = contexto_nuevo
-                st.session_state["superficie"] = area_nueva
-                st.session_state["plantas"] = int(plantas_nuevas)
-                st.session_state["area_ok"] = False
-                st.session_state["hidraulica_ok"] = False
-                st.session_state["huella_catalogo"] = huella
+                st.session_state["catalogo_trabajo"] = nuevo_catalogo
+                st.session_state["firma_catalogo"] = firma
             except Exception as exc:
                 st.error(f"No se pudo importar: {exc}")
                 st.stop()
 
-catalogo = st.session_state.get(
-    "catalogo_tabla", pd.DataFrame(columns=COLUMNAS)
-)
-original = st.session_state.get("catalogo_original", {})
-contexto = st.session_state.get("contexto_catalogo", {})
-
-st.session_state.setdefault("superficie", 2500.0)
-st.session_state.setdefault("plantas", 5000)
-
-# ---------- CONFIGURACIÓN ----------
-with st.sidebar:
-    st.header("Cultivo")
-    plantas = st.number_input(
-        "Plantas totales", min_value=1, step=100, key="plantas"
-    )
-    sectores = st.number_input(
-        "Sectores iguales", min_value=1, value=4, step=1
-    )
-    superficie = st.number_input(
-        "Superficie cultivada · m²",
-        min_value=1.0, step=10.0, key="superficie",
-    )
-    area_ok = st.checkbox(
-        "Confirmo la superficie cultivada", key="area_ok"
-    )
-    st.info(
-        "3 etapas × 5 semanas × 5 aplicaciones/semana "
-        "= 75 aplicaciones."
-    )
-
-    st.header("Riego e inyección")
-    caudal = st.number_input(
-        "Agua antes del Venturi · L/min por sector",
-        min_value=0.1, value=125.0,
-    )
-    minutos = st.number_input(
-        "Riego por sector · minutos",
-        min_value=0.1, value=15.0,
-    )
-    inyeccion = st.number_input(
-        "Inyección por sector · minutos",
-        min_value=0.1, value=10.0,
-    )
-    succion = st.number_input(
-        "Succión medida · L/min",
-        min_value=0.01, value=1.0,
-    )
-    tanque = st.number_input(
-        "Volumen final de solución madre · L",
-        min_value=1.0, value=200.0,
-    )
-    hidraulica_ok = st.checkbox(
-        "Caudal y succión comprobados en campo",
-        key="hidraulica_ok",
-    )
-    st.caption(
-        "Una aplicación por jornada de fertilización en todos los "
-        "sectores. Sectores con igual caudal, duración y reparto."
-    )
-
-if inyeccion > minutos:
-    st.error("La inyección no puede durar más que el riego.")
-    st.stop()
-
-ha = superficie / 10000
-dias_semana = 5
-dias_etapa = 25
-agua_sector = caudal * minutos
-madre_sector = succion * inyeccion
-agua_dia = agua_sector * sectores
-madre_dia = madre_sector * sectores
-final_dia = agua_dia + madre_dia
-final_inyeccion = (caudal + succion) * inyeccion * sectores
-
-tabs = st.tabs([
-    "1 · Etapas",
-    "2 · Agua y ppm",
-    "3 · Fertilizantes",
-    "4 · Formulador",
-    "5 · Tanque y alertas",
-])
-
-# ---------- ETAPAS ----------
-with tabs[0]:
-    st.subheader("Distribución por etapas")
-    referencia = contexto.get("ciclo_referencia_dias", "no indicado")
-    st.caption(
-        f"Ciclo registrado en el catálogo: {referencia} días. "
-        "Calendario simulado: 15 semanas, 105 días calendario "
-        "y 75 jornadas de fertilización."
-    )
-    st.warning(
-        "Los totales kg/ha son la referencia de tu código anterior. "
-        "Importar el catálogo no verifica su origen ni que correspondan "
-        "al ciclo registrado. Redistribuirlos requiere revisión agronómica."
-    )
-
-    base = pd.DataFrame(
-        [r[:5] for r in FILAS],
-        columns=["Declaración", "kg/ha ciclo"] + ETAPAS,
-    )
-    plan = st.data_editor(
-        base,
-        disabled=["Declaración"],
-        hide_index=True,
-        key="plan_etapas",
-        column_config={
-            "kg/ha ciclo": st.column_config.NumberColumn(min_value=0.0),
-            **{
-                e: st.column_config.NumberColumn(
-                    f"{e} · %", min_value=0.0, max_value=100.0
-                )
-                for e in ETAPAS
-            },
-        },
-    )
-    validar_no_negativos(
-        plan[["kg/ha ciclo"] + ETAPAS],
-        "Completa el plan con números finitos no negativos.",
-    )
-    if (
-        (plan[ETAPAS] > 100).any().any()
-        or not np.allclose(
-            plan[ETAPAS].sum(axis=1), 100, atol=1e-6, rtol=0
-        )
-    ):
-        st.error("Cada fila debe repartir exactamente 100% entre etapas.")
+    if "catalogo_trabajo" not in st.session_state:
+        st.info("Carga tu JSON para comenzar.")
         st.stop()
 
-    etapa = st.selectbox("Etapa de la simulación", ETAPAS)
-    indice = ETAPAS.index(etapa)
-    st.write(
-        f"Semanas **{indice * 5 + 1} a {(indice + 1) * 5}** · "
-        "**25 aplicaciones**."
-    )
-
-    objetivo_g = pd.Series(0.0, index=ELEMENTOS)
-    detalle = []
-    for _, fila in plan.iterrows():
-        elemento, factor = FACTORES_PLAN[fila["Declaración"]]
-        kg = fila["kg/ha ciclo"] * ha * fila[etapa] / 100
-        gramos = kg * 1000 * factor / dias_etapa
-        objetivo_g[elemento] += gramos
-        detalle.append({
-            "Declaración original": fila["Declaración"],
-            "kg declarados/etapa": kg,
-            "Elemento": elemento,
-            "g elementales/día · cultivo": gramos,
-            "g elementales/día · sector": gramos / sectores,
-            "kg elementales/semana": gramos * dias_semana / 1000,
-        })
-    st.dataframe(pd.DataFrame(detalle).round(5), hide_index=True)
-    st.caption(
-        "Día significa jornada de fertilización. Son masas de nutrientes, "
-        "no masas de productos comerciales. No se presupone que el "
-        "cobalto de la referencia sea necesario para tomate."
-    )
-
-# ---------- AGUA ----------
-with tabs[1]:
-    st.subheader("Agua y concentraciones elementales")
-    a, b, c = st.columns(3)
-    a.metric("Agua portadora / jornada", f"{agua_dia:,.1f} L")
-    b.metric("Solución madre / jornada", f"{madre_dia:,.1f} L")
-    c.metric("Volumen final / planta", f"{final_dia / plantas:.3f} L")
-
-    st.write(
-        f"Riego secuencial: **{minutos * sectores:.1f} min**. "
-        f"Succión / agua portadora: **{100 * succion / caudal:.2f}%**."
-    )
-    st.caption(
-        "El caudal es el medido antes de añadir solución madre. "
-        "Se aproximan volúmenes aditivos y succión constante."
-    )
-
-    agua_df = st.data_editor(
-        pd.DataFrame({
-            "Elemento": ELEMENTOS,
-            "ppm agua": np.zeros(len(ELEMENTOS)),
-        }),
-        disabled=["Elemento"],
-        hide_index=True,
-        key="analisis_agua",
-        column_config={
-            "ppm agua": st.column_config.NumberColumn(min_value=0.0),
-        },
-    )
-    ppm_agua = agua_df.set_index("Elemento")["ppm agua"].reindex(ELEMENTOS)
-    validar_no_negativos(ppm_agua, "Revisa los valores del agua.")
-
-    analisis_ok = st.checkbox(
-        "Análisis confirmado para los elementos modelados"
-    )
-    misma_agua = st.checkbox(
-        "La solución madre se prepara con la misma agua analizada"
-    )
-    st.caption(
-        "Introduce mg/L del elemento, no del ion: NO₃ no equivale a N. "
-        "Un cero no debe usarse para sustituir un dato desconocido."
-    )
-
-    # Modelo válido si la solución madre utiliza la misma agua.
-    agua_g = ppm_agua * final_dia / 1000
-    ppm_plan = objetivo_g * 1000 / final_dia
-
-    modo = st.radio(
-        "Objetivo",
-        ["Distribución por etapas", "PPM manuales"],
-        horizontal=True,
-    )
-    if modo == "PPM manuales":
-        manual = st.data_editor(
-            pd.DataFrame({
-                "Elemento": ELEMENTOS,
-                "ppm objetivo": ppm_plan.values,
-            }),
-            disabled=["Elemento"],
-            hide_index=True,
-            key=f"ppm_manual_{etapa}",
-            column_config={
-                "ppm objetivo": st.column_config.NumberColumn(min_value=0.0),
-            },
+    if st.button("Restaurar catálogo importado"):
+        st.session_state["catalogo_trabajo"] = copy.deepcopy(
+            st.session_state["catalogo_importado"]
         )
-        ppm_obj = manual.set_index("Elemento")["ppm objetivo"].reindex(
-            ELEMENTOS
-        )
+        st.rerun()
+
+    st.caption(
+        "Los cambios son temporales y no sobrescriben el JSON."
+    )
+
+
+# ============================================================
+# PERFILES CONFIRMADOS
+# ============================================================
+
+with st.sidebar.expander("Integrar porcentajes confirmados"):
+    productos = st.session_state["catalogo_trabajo"]["productos"]
+
+    perfil = st.selectbox(
+        "Perfil confirmado",
+        list(PERFILES_CONFIRMADOS),
+    )
+
+    crear = st.checkbox("Añadir un producto que no existe")
+
+    if crear:
+        nuevo_id = st.text_input("ID nuevo y único").strip()
+        nuevo_nombre = st.text_input("Nombre comercial").strip()
+        destino = None
     else:
-        ppm_obj = ppm_plan.copy()
-
-    validar_no_negativos(ppm_obj, "Revisa las ppm objetivo.")
-    objetivo_total_g = ppm_obj * final_dia / 1000
-    deficit_g = (objetivo_total_g - agua_g).clip(lower=0)
-
-    st.dataframe(pd.DataFrame({
-        "Elemento": ELEMENTOS,
-        "Objetivo promedio · ppm": ppm_obj.values,
-        "Agua · ppm": ppm_agua.values,
-        "Déficit · g/jornada": deficit_g.values,
-        "Durante inyección si se cubre el déficit · ppm":
-            (ppm_agua + deficit_g * 1000 / final_inyeccion).values,
-    }).round(5), hide_index=True)
-
-    if (agua_g > objetivo_total_g + 1e-9).any():
-        st.warning(
-            "El agua supera algún objetivo. Añadir fertilizantes "
-            "no elimina ese exceso."
+        destino = st.selectbox(
+            "Producto correspondiente en el catálogo",
+            list(productos),
+            format_func=lambda k: f"{productos[k]['nombre']} · {k}",
         )
-    if not (analisis_ok and misma_agua):
-        st.warning(
-            "Balance de agua provisional. El cálculo de productos requiere "
-            "confirmar el análisis y el origen del agua de preparación."
-        )
-    st.info(
-        "Abonisa no se inyecta ni se descuenta automáticamente: su masa "
-        "aplicada al suelo no determina su disponibilidad diaria."
+
+    aceptar = st.checkbox(
+        "Confirmo que corresponde exactamente al perfil seleccionado"
     )
 
-# ---------- CATÁLOGO ----------
-with tabs[2]:
-    st.subheader("Tu catálogo original")
-    if catalogo.empty:
-        st.info("Carga tu JSON en la barra lateral.")
-    else:
-        total = len(catalogo)
-        aptos = int(catalogo["Apto para cálculo"].sum())
-        a, b, c = st.columns(3)
-        a.metric("Productos importados", total)
-        b.metric(
-            "Bloqueos originales",
-            int(catalogo["Bloqueo original"].sum()),
-        )
-        c.metric("Aptos para cálculo", aptos)
+    if st.button("Aplicar composición"):
+        try:
+            if not aceptar:
+                raise ValueError("Confirma la correspondencia del producto.")
 
-        st.dataframe(
-            catalogo.drop(columns=["ID"]).round(5),
-            hide_index=True,
-        )
-        st.caption(
-            "Celdas vacías = desconocido, no cero. Los porcentajes "
-            "mostrados son elementales. Los datos originales se conservan."
-        )
-
-        ids = catalogo["ID"].tolist()
-        nombres = catalogo.set_index("ID")["Producto"].to_dict()
-        elegido = st.selectbox(
-            "Consultar producto",
-            ids,
-            format_func=lambda x: nombres[x],
-        )
-        fila = catalogo.set_index("ID").loc[elegido]
-        producto = original["productos"][elegido]
-
-        if fila["Apto para cálculo"]:
-            st.success("Cumple los requisitos de entrada del cálculo.")
-        else:
-            st.warning(fila["Motivos"])
-
-        st.markdown("**Pendientes del catálogo**")
-        pendientes = lista_textos(producto.get("pendientes"))
-        if pendientes:
-            for texto in pendientes:
-                st.write(f"• {texto}")
-        else:
-            st.write(
-                "Sin pendientes específicos anotados. Esto no equivale "
-                "a validación documental."
+            candidato = copy.deepcopy(
+                st.session_state["catalogo_trabajo"]
             )
 
-        st.markdown("**Observaciones originales**")
-        for texto in lista_textos(producto.get("observaciones")):
-            st.write(f"• {texto}")
+            if crear:
+                if not nuevo_id or not nuevo_nombre:
+                    raise ValueError("Indica ID y nombre.")
+                if nuevo_id in candidato["productos"]:
+                    raise ValueError("El ID ya existe.")
 
-        with st.expander("Ver ficha original completa"):
-            st.json(producto)
+                nombres = {
+                    str(p["nombre"]).strip().casefold()
+                    for p in candidato["productos"].values()
+                }
+                if nuevo_nombre.casefold() in nombres:
+                    raise ValueError("El nombre ya existe.")
 
-        st.info(
-            "Esta pantalla no permite desbloquear productos. Para una "
-            "futura ficha validada se requieren verificación, solubilidad, "
-            "ausencia de pendientes y composición suficiente para el balance. "
-            "No se deben rellenar desconocidos con cero sin respaldo técnico."
-        )
+                destino = nuevo_id
+                candidato["productos"][destino] = {
+                    "nombre": nuevo_nombre,
+                    "estado": "pendiente_validacion_uso",
+                    "bloqueado_dosificacion_automatica": True,
+                    "verificado": False,
+                    "soluble": None,
+                }
 
-# ---------- FORMULADOR ----------
-resultado = None
-seleccionados = pd.DataFrame()
-dosis_g = None
+            candidato["productos"][destino] = aplicar_perfil_confirmado(
+                candidato["productos"][destino],
+                perfil,
+            )
 
-with tabs[3]:
-    st.subheader("Formulación no negativa")
+            st.session_state["catalogo_trabajo"] = candidato
+            st.session_state["aviso_perfil"] = (
+                f"Composición de {perfil} incorporada. "
+                "Se mantienen bloqueos y pendientes."
+            )
+            st.rerun()
+
+        except Exception as exc:
+            st.error(str(exc))
+
     st.caption(
-        "Los productos con micronutrientes no se excluyen por contenerlos. "
-        "Se exige composición conocida para todos los elementos modelados "
-        "y se conservan los bloqueos originales."
+        "Esta operación confirma porcentajes, no autoriza aplicaciones."
     )
 
-    disponibles = catalogo.loc[
-        catalogo["Apto para cálculo"].eq(True)
-    ].copy()
+if "aviso_perfil" in st.session_state:
+    st.success(st.session_state.pop("aviso_perfil"))
 
-    nombres = st.multiselect(
-        "Productos validados a utilizar",
-        disponibles["Producto"].tolist(),
+
+# ============================================================
+# CONFIGURACIÓN DEL CULTIVO
+# ============================================================
+
+with st.sidebar:
+    st.header("Cultivo y calendario")
+    st.caption(
+        "Valores iniciales según lo acordado. "
+        "Compruébalos antes de calcular."
     )
-    confirmado = st.checkbox(
-        "Entiendo que el resultado es una simulación pendiente "
-        "de revisión agronómica"
+
+    superficie = st.number_input(
+        "Superficie del cultivo (m²)",
+        min_value=1.0,
+        value=2500.0,
+        step=100.0,
     )
+    plantas = st.number_input(
+        "Número de plantas",
+        min_value=1,
+        value=5000,
+        step=100,
+    )
+    dias_referencia = st.number_input(
+        "Ciclo de referencia del catálogo (días)",
+        min_value=1,
+        value=120,
+    )
+    semanas_etapa = st.number_input(
+        "Semanas por etapa",
+        min_value=1,
+        value=5,
+    )
+    aplicaciones_semana = st.number_input(
+        "Aplicaciones por semana",
+        min_value=1,
+        max_value=7,
+        value=5,
+    )
+    referencia_mgo = st.number_input(
+        "Referencia del ciclo (kg MgO/ha)",
+        min_value=0.0,
+        value=89.3,
+        step=0.1,
+    )
+
+catalogo = st.session_state["catalogo_trabajo"]
+tabla = tabla_catalogo(catalogo)
+
+hectareas = superficie / 10000
+aplicaciones_etapa = semanas_etapa * aplicaciones_semana
+aplicaciones_totales = 3 * aplicaciones_etapa
+dias_calendario = 3 * semanas_etapa * 7
+
+etapas = [
+    ("Vegetativo", 0.30),
+    ("Desarrollo", 0.40),
+    ("Llenado", 0.30),
+]
+
+plan = pd.DataFrame([
+    {
+        "Etapa": nombre,
+        "Distribución (%)": fraccion * 100,
+        "Aplicaciones": aplicaciones_etapa,
+        "MgO (kg/ha · etapa)": referencia_mgo * fraccion,
+        "MgO (kg · cultivo · etapa)": (
+            referencia_mgo * fraccion * hectareas
+        ),
+        "Mg elemental (g · cultivo · aplicación)": (
+            referencia_mgo
+            * fraccion
+            * hectareas
+            * OXIDOS["Mg"][1]
+            * 1000
+            / aplicaciones_etapa
+        ),
+    }
+    for nombre, fraccion in etapas
+])
+
+tab_plan, tab_catalogo, tab_calculo = st.tabs([
+    "Plan nutricional",
+    "Fertilizantes",
+    "Formulador",
+])
+
+
+# ============================================================
+# PLAN
+# ============================================================
+
+with tab_plan:
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Superficie", f"{superficie:,.0f} m²")
+    c2.metric("Plantas", f"{plantas:,}")
+    c3.metric("Aplicaciones", aplicaciones_totales)
+
+    st.dataframe(plan.round(4), hide_index=True, use_container_width=True)
+
+    st.info(
+        f"Calendario de fertilización: {3 * semanas_etapa} semanas "
+        f"({dias_calendario} días naturales). "
+        f"Ciclo de referencia: {dias_referencia} días. "
+        "Son conceptos distintos; no se redistribuyen automáticamente."
+    )
+
+    st.warning(
+        "89,3 kg/ha de MgO es la referencia acordada, no una "
+        "recomendación universal. El resto de objetivos debe definirse "
+        "con el análisis de agua, suelo o sustrato y el criterio técnico."
+    )
+
+
+# ============================================================
+# CATÁLOGO
+# ============================================================
+
+with tab_catalogo:
+    st.subheader("Catálogo de trabajo de esta sesión")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Productos", len(tabla))
+    c2.metric(
+        "Composiciones confirmadas",
+        int(tabla["Composición confirmada"].sum()),
+    )
+    c3.metric(
+        "Aptos para cálculo",
+        int(tabla["Apto para cálculo"].sum()),
+    )
+
+    st.dataframe(tabla, hide_index=True, use_container_width=True)
+
+    st.caption(
+        "N, P, K, Ca, Mg, S y micronutrientes se muestran como "
+        "porcentajes elementales. Las formas de N ya están incluidas "
+        "en el N total. Las celdas vacías indican datos desconocidos."
+    )
+
+    detalle_id = st.selectbox(
+        "Consultar registro completo",
+        list(catalogo["productos"]),
+        format_func=lambda k: f"{catalogo['productos'][k]['nombre']} · {k}",
+    )
+    st.json(catalogo["productos"][detalle_id])
+
+    st.info(
+        "Los nutrientes no declarados se convierten a cero solamente "
+        "al aplicar un perfil confirmado. El resto de valores null "
+        "permanece como desconocido. Esta pantalla no retira bloqueos."
+    )
+
+    with st.expander("Metadatos originales"):
+        st.json({
+            k: v for k, v in catalogo.items()
+            if k != "productos"
+        })
+
+
+# ============================================================
+# FORMULADOR
+# ============================================================
+
+with tab_calculo:
+    st.subheader("Balance por aplicación y para todo el cultivo")
+
+    etapa = st.selectbox("Etapa", plan["Etapa"].tolist())
+    fila_plan = plan.loc[plan["Etapa"] == etapa].iloc[0]
+
+    volumen = st.number_input(
+        "Agua total entregada al cultivo por aplicación (litros)",
+        min_value=0.0,
+        value=0.0,
+        step=100.0,
+        help=(
+            "No es el volumen del tanque madre. Introduce el volumen "
+            "de agua realmente aplicado al cultivo."
+        ),
+    )
+
+    mg_referencia = float(
+        fila_plan["Mg elemental (g · cultivo · aplicación)"]
+    )
+    st.info(
+        f"Referencia para {etapa}: {mg_referencia:.3f} g de Mg "
+        "elemental por aplicación en todo el cultivo."
+    )
+
+    st.markdown("**Objetivos y análisis del agua**")
+    st.caption(
+        "Activa únicamente nutrientes con objetivo definido. "
+        "Los objetivos están en gramos elementales por aplicación "
+        "para todo el cultivo. El agua se expresa en mg/L del elemento, "
+        "no del ion ni del óxido."
+    )
+
+    objetivos_base = pd.DataFrame({
+        "Elemento": ELEMENTOS,
+        "Usar objetivo": [e == "Mg" for e in ELEMENTOS],
+        "Objetivo total (g/aplicación)": [
+            mg_referencia if e == "Mg" else 0.0
+            for e in ELEMENTOS
+        ],
+        "Agua (mg/L elemental)": [0.0] * len(ELEMENTOS),
+    })
+
+    objetivos = st.data_editor(
+        objetivos_base,
+        hide_index=True,
+        disabled=["Elemento"],
+        use_container_width=True,
+        key=(
+            f"objetivos_{etapa}_{superficie}_{referencia_mgo}_"
+            f"{aplicaciones_etapa}"
+        ),
+        column_config={
+            "Usar objetivo": st.column_config.CheckboxColumn(),
+            "Objetivo total (g/aplicación)": (
+                st.column_config.NumberColumn(min_value=0.0)
+            ),
+            "Agua (mg/L elemental)": (
+                st.column_config.NumberColumn(min_value=0.0)
+            ),
+        },
+    )
+
+    disponibles = tabla.loc[tabla["Apto para cálculo"]].copy()
 
     if disponibles.empty:
         st.warning(
-            "No hay productos aptos. Con tu catálogo actual esto es "
-            "esperable: los 18 conservan bloqueo documental. "
-            "Consulta sus pendientes en Fertilizantes."
+            "No hay productos aptos para cálculo. Confirmar porcentajes "
+            "no elimina bloqueos de uso. Consulta los motivos individuales "
+            "en la pestaña Fertilizantes."
         )
-    elif not nombres:
-        st.info("Selecciona productos validados.")
-    elif not all([
-        area_ok, hidraulica_ok, analisis_ok, misma_agua, confirmado
-    ]):
-        st.warning(
-            "Confirma superficie, hidráulica, análisis del agua, agua "
-            "de preparación y revisión técnica para calcular."
-        )
+
     else:
-        seleccionados = disponibles.loc[
-            disponibles["Producto"].isin(nombres)
-        ].copy().reset_index(drop=True)
+        nombres = disponibles.set_index("ID")["Producto"].to_dict()
 
-        A = seleccionados[ELEMENTOS].to_numpy(dtype=float).T / 100
-        b = deficit_g.to_numpy(dtype=float)
-
-        # Ajuste relativo de TODOS los elementos, incluidos micros.
-        # Los pisos numéricos son ponderaciones, no límites de seguridad.
-        piso_ppm = np.array([
-            0.1 if e in MACROS else 0.001 for e in ELEMENTOS
-        ])
-        escala = np.maximum(b, piso_ppm * final_dia / 1000)
-
-        ajuste = lsq_linear(
-            A / escala[:, None],
-            b / escala,
-            bounds=(0, np.inf),
-            tol=1e-10,
-            max_iter=1000,
+        ids = st.multiselect(
+            "Productos autorizados que participarán",
+            disponibles["ID"].tolist(),
+            format_func=lambda k: f"{nombres[k]} · {k}",
         )
 
-        if not ajuste.success or not np.isfinite(ajuste.x).all():
-            st.error("El ajuste no convergió. Revisa objetivos y productos.")
-        else:
-            dosis_g = np.maximum(ajuste.x, 0)
-            dosis_g[dosis_g < 1e-8] = 0
+        if ids:
+            seleccionados = (
+                disponibles.set_index("ID").loc[ids].reset_index()
+            )
 
-            resultado = pd.DataFrame({
-                "Producto": seleccionados["Producto"],
-                "g/jornada · cultivo": dosis_g,
-                "g/jornada · sector": dosis_g / sectores,
-                "kg/semana · cultivo": dosis_g * 5 / 1000,
-                "kg/etapa · cultivo": dosis_g * 25 / 1000,
-            })
-            st.dataframe(resultado.round(6), hide_index=True)
+            st.markdown("**Límites por producto**")
             st.caption(
-                "Semana = 5 aplicaciones; etapa = 25 aplicaciones "
-                "idénticas. No multipliques otra vez por los sectores."
+                "Introduce un límite técnico en gramos por aplicación. "
+                "Un límite de cero excluye el producto. "
+                "No se asignan máximos agronómicos automáticamente."
             )
 
-            aportes = A @ dosis_g
-            alcanzado = (
-                aportes + agua_g.to_numpy(dtype=float)
-            ) * 1000 / final_dia
-            durante = (
-                ppm_agua.to_numpy(dtype=float)
-                + aportes * 1000 / final_inyeccion
-            )
-            diferencia = alcanzado - ppm_obj.to_numpy(dtype=float)
-
-            st.dataframe(pd.DataFrame({
-                "Elemento": ELEMENTOS,
-                "Objetivo promedio · ppm": ppm_obj.values,
-                "Alcanzado promedio · ppm": alcanzado,
-                "Diferencia · ppm": diferencia,
-                "Durante inyección · ppm": durante,
-            }).round(6), hide_index=True)
-
-            tolerancia = np.maximum(
-                piso_ppm, 0.05 * ppm_obj.to_numpy(dtype=float)
-            )
-            if (np.abs(diferencia) > tolerancia).any():
-                st.error(
-                    "Hay faltantes o excesos fuera del criterio numérico "
-                    "de ajuste. No tratar el resultado como receta."
-                )
-            else:
-                st.info(
-                    "El ajuste cumple el criterio numérico: 5% del "
-                    "objetivo, con piso de 0,1 ppm para macros y "
-                    "0,001 ppm para micros. NO son límites agronómicos."
-                )
-
-            st.warning(
-                "El optimizador no impone límites agronómicos máximos, "
-                "no valida seguridad de micronutrientes, no estima CE "
-                "y no optimiza formas de nitrógeno. Aproximar objetivos "
-                "no equivale a autorizar una aplicación."
+            limites = st.data_editor(
+                pd.DataFrame({
+                    "ID": ids,
+                    "Producto": [nombres[k] for k in ids],
+                    "Máximo (g/aplicación)": [0.0] * len(ids),
+                }),
+                hide_index=True,
+                disabled=["ID", "Producto"],
+                use_container_width=True,
+                key="limites_" + "|".join(ids),
+                column_config={
+                    "Máximo (g/aplicación)": (
+                        st.column_config.NumberColumn(min_value=0.0)
+                    ),
+                },
             )
 
-# ---------- TANQUE ----------
-with tabs[4]:
-    st.subheader("Solución madre")
-    st.write(
-        f"Consumo por sector: **{madre_sector:.2f} L**. "
-        f"Consumo por jornada: **{madre_dia:.2f} L**."
-    )
-    st.write(
-        f"Una preparación de **{tanque:.1f} L** equivale a "
-        f"**{tanque / madre_dia:.2f} jornadas**, solo hidráulicamente."
-    )
-    st.caption(
-        "No valida estabilidad, almacenamiento ni cambio de etapa."
-    )
+            revisar = st.checkbox(
+                "He revisado objetivos, análisis del agua, límites "
+                "y compatibilidad de los productos"
+            )
 
-    if resultado is None:
-        st.info(
-            "Las cantidades de tanque se mostrarán cuando exista "
-            "una formulación con productos validados."
-        )
-    else:
-        mascara = dosis_g > 0
-        activos = seleccionados.loc[mascara].copy()
-        activos["g_dia"] = dosis_g[mascara]
+            if st.button("Calcular balance", type="primary"):
+                try:
+                    if lsq_linear is None:
+                        raise ValueError(
+                            "Falta scipy. Agrégalo a requirements.txt."
+                        )
+                    if volumen <= 0:
+                        raise ValueError(
+                            "Introduce el volumen de agua por aplicación."
+                        )
+                    if not revisar:
+                        raise ValueError(
+                            "Confirma la revisión técnica de los datos."
+                        )
 
-        if activos.empty:
-            st.info("El cálculo no asignó fertilizante.")
-        else:
-            tiene_ca = activos["Ca"] > 0
-            tiene_ps = (activos["P"] > 0) | (activos["S"] > 0)
-            conflicto = bool(tiene_ca.any() and tiene_ps.any())
+                    objetivos_num = objetivos[
+                        [
+                            "Objetivo total (g/aplicación)",
+                            "Agua (mg/L elemental)",
+                        ]
+                    ].to_numpy(dtype=float)
 
-            if conflicto:
-                st.error(
-                    "Se bloquea la preparación de un concentrado único: "
-                    "se detectan aportes de calcio y fósforo/azufre."
-                )
-                st.caption(
-                    "Es una alerta conservadora basada en elementos. "
-                    "La especie química real debe verificarse en las fichas."
-                )
-                grupos = []
-                for _, fila in activos.iterrows():
-                    ca = fila["Ca"] > 0
-                    ps = fila["P"] > 0 or fila["S"] > 0
-                    if ca and ps:
-                        grupo = "Revisar ficha: ambos grupos"
-                    elif ca:
-                        grupo = "A · asignación preliminar"
-                    elif ps:
-                        grupo = "B · asignación preliminar"
-                    else:
-                        grupo = "Asignación pendiente"
-                    grupos.append(grupo)
+                    maximos = limites[
+                        "Máximo (g/aplicación)"
+                    ].to_numpy(dtype=float)
 
-                st.dataframe(pd.DataFrame({
-                    "Producto": activos["Producto"].values,
-                    "Grupo preliminar": grupos,
-                    "g/jornada · cultivo": activos["g_dia"].values,
-                }), hide_index=True)
-                st.warning(
-                    "No se calculan concentraciones A/B sin definir "
-                    "tiempos y succión de cada preparación. Con un único "
-                    "Venturi no se puede asignar a ambos grupos todo el "
-                    "tiempo disponible. Revisar también pre-riego, lavado "
-                    "y tránsito hidráulico."
-                )
-            else:
-                concentracion = activos["g_dia"] / madre_dia
-                st.dataframe(pd.DataFrame({
-                    "Producto": activos["Producto"].values,
-                    "g/L solución madre": concentracion.values,
-                    "kg para volumen final preparado":
-                        (concentracion * tanque / 1000).values,
-                }).round(6), hide_index=True)
+                    if (
+                        not np.isfinite(objetivos_num).all()
+                        or (objetivos_num < 0).any()
+                        or not np.isfinite(maximos).all()
+                        or (maximos < 0).any()
+                    ):
+                        raise ValueError(
+                            "Los objetivos, el agua y los límites deben "
+                            "ser números finitos no negativos."
+                        )
 
-                st.warning(
-                    "No detectar la alerta calcio–P/S no demuestra "
-                    "compatibilidad. Verificar sales, quelatos, pH, "
-                    "temperatura y solubilidad de la mezcla."
-                )
-                st.caption(
-                    "Completar hasta el volumen final indicado; no añadir "
-                    "los productos a ese volumen de agua ya lleno."
-                )
-                if tanque < madre_dia:
-                    st.warning(
-                        "El volumen preparado no alcanza para una jornada. "
-                        "Harían falta reposiciones a igual concentración."
+                    activos = objetivos[
+                        "Usar objetivo"
+                    ].fillna(False).to_numpy(dtype=bool)
+
+                    if not activos.any():
+                        raise ValueError("Activa al menos un objetivo.")
+
+                    permitidos = maximos > 0
+                    if not permitidos.any():
+                        raise ValueError(
+                            "Introduce al menos un límite mayor que cero."
+                        )
+
+                    # g de elemento por cada g de fertilizante.
+                    matriz = (
+                        seleccionados[ELEMENTOS]
+                        .to_numpy(dtype=float).T / 100
                     )
 
-    st.markdown("**Antes de cualquier aplicación**")
-    st.markdown(
-        "- Revisar necesidad del cultivo, suelo y abonado de fondo.\n"
-        "- Confirmar composición y autorización de uso de cada producto.\n"
-        "- Comprobar análisis de agua, pH y conductividad eléctrica.\n"
-        "- Verificar solubilidad y compatibilidad a concentración real.\n"
-        "- No inyectar Abonisa ni productos de composición incierta.\n"
-        "- Revisar los aportes totales de micronutrientes.\n"
-        "- No considerar la referencia de cobalto como una necesidad validada."
-    )
+                    objetivo_total = objetivos_num[:, 0]
+                    aporte_agua = objetivos_num[:, 1] * volumen / 1000
+                    faltante = np.maximum(
+                        objetivo_total - aporte_agua, 0.0
+                    )
 
-st.caption(
-    "El JSON original no se modifica. Los datos cargados permanecen "
-    "solo durante la sesión; conserva tu archivo original. "
-    "Código pendiente de prueba en tu despliegue."
-)
+                    # Ajuste relativo; para objetivos cero se utiliza
+                    # una escala numérica de 1 g, no un umbral agronómico.
+                    escalas = np.where(
+                        objetivo_total[activos] > 0,
+                        objetivo_total[activos],
+                        1.0,
+                    )
+
+                    a = matriz[activos][:, permitidos]
+                    a = a / escalas[:, None]
+                    b = faltante[activos] / escalas
+
+                    solucion = lsq_linear(
+                        a,
+                        b,
+                        bounds=(
+                            np.zeros(int(permitidos.sum())),
+                            maximos[permitidos],
+                        ),
+                        method="trf",
+                    )
+
+                    if not solucion.success:
+                        raise ValueError(
+                            "El ajuste no convergió: " + solucion.message
+                        )
+
+                    dosis = np.zeros(len(ids))
+                    dosis[permitidos] = solucion.x
+                    aporte_fertilizantes = matriz @ dosis
+                    aporte_total = aporte_fertilizantes + aporte_agua
+
+                    resultado_dosis = pd.DataFrame({
+                        "Producto": seleccionados["Producto"].tolist(),
+                        "g/aplicación · cultivo": dosis,
+                        "g/planta · aplicación": dosis / plantas,
+                        "kg/etapa · cultivo": (
+                            dosis * aplicaciones_etapa / 1000
+                        ),
+                    })
+
+                    st.markdown("**Dosis del ajuste matemático**")
+                    st.dataframe(
+                        resultado_dosis.round(5),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+
+                    balance = pd.DataFrame({
+                        "Elemento": ELEMENTOS,
+                        "Objetivo activo": activos,
+                        "Objetivo (g)": np.where(
+                            activos, objetivo_total, np.nan
+                        ),
+                        "Agua (g)": aporte_agua,
+                        "Fertilizantes (g)": aporte_fertilizantes,
+                        "Total (g)": aporte_total,
+                        "Diferencia total − objetivo (g)": np.where(
+                            activos,
+                            aporte_total - objetivo_total,
+                            np.nan,
+                        ),
+                        "Concentración total (mg/L)": (
+                            aporte_total * 1000 / volumen
+                        ),
+                    })
+
+                    st.markdown("**Balance elemental por aplicación**")
+                    st.dataframe(
+                        balance.round(5),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+
+                    detalle_n = []
+                    usados = dosis > 1e-8
+
+                    for clave, etiqueta in [
+                        ("N_nitrico", "N nítrico"),
+                        ("N_amoniacal", "N amoniacal"),
+                        ("N_ureico", "N ureico"),
+                    ]:
+                        porcentajes = seleccionados[
+                            clave
+                        ].to_numpy(dtype=float)
+
+                        gramos = np.nan
+                        if np.isfinite(porcentajes[usados]).all():
+                            gramos = float(np.sum(
+                                porcentajes[usados]
+                                * dosis[usados] / 100
+                            ))
+
+                        detalle_n.append({
+                            "Forma": etiqueta,
+                            "Fertilizantes (g/aplicación)": gramos,
+                            "Añadido al agua (mg/L de N)": (
+                                gramos * 1000 / volumen
+                            ),
+                        })
+
+                    st.markdown("**Desglose del N de los fertilizantes**")
+                    st.dataframe(
+                        pd.DataFrame(detalle_n).round(5),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+                    st.caption(
+                        "Estas formas ya están incluidas en el N total. "
+                        "No se suman otra vez. No se desglosa el N del agua."
+                    )
+
+                    if (aporte_agua[activos] > objetivo_total[activos]).any():
+                        st.warning(
+                            "El agua por sí sola supera al menos un "
+                            "objetivo. El fertilizante no puede retirar "
+                            "ese exceso."
+                        )
+
+                    if (~activos).any():
+                        st.warning(
+                            "Hay nutrientes sin objetivo: se muestran "
+                            "sus aportes, pero no se limita su exceso. "
+                            "Revisa especialmente B, Cu y Mo antes de "
+                            "considerar una aplicación."
+                        )
+
+                    for identificador in ids:
+                        observaciones = lista_textos(
+                            catalogo["productos"][identificador].get(
+                                "observaciones"
+                            )
+                        )
+                        if observaciones:
+                            st.info(
+                                nombres[identificador] + ": "
+                                + " | ".join(observaciones)
+                            )
+
+                    st.warning(
+                        "Resultado matemático, no receta autorizada. "
+                        "El ajuste puede dejar déficits o excesos y no "
+                        "optimiza costos. Las concentraciones son "
+                        "promedios del volumen declarado, no del tanque "
+                        "madre ni del pulso de inyección. No se calcula "
+                        "pH, CE, precipitación ni compatibilidad."
+                    )
+
+                except Exception as exc:
+                    st.error(str(exc))
+        else:
+            st.info("Selecciona al menos un producto apto.")
